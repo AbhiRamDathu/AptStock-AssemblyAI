@@ -31,3 +31,66 @@ __pycache__/
 # Environment variables
 .env
 *.env
+amd_engine/
+aptstock-assemblyai-demo/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+.env.*git status --ignored
+
+# AMD challenge experiments
+amd_engine/
+
+# Demo artifacts
+aptstock-assemblyai-demo/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local environments
+backend/venv/
+frontend/node_modules/
+frontend/dist/
+
+# Database backups
+backend/backups/
+
+# Local/test artifacts
+backend/app/routes/New Text Document.txt
+backend/app/routes/ingest.py.backup
+backend/app/routes/Sales data files/
+backend/test_sales.csv
+
+# Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+
+# AMD
+amd_engine/
+
+# Demo / temporary
+aptstock-assemblyai-demo/
+
+# Backups
+backend/backups/
+
+# Local test files
+backend/test_sales.csv
+backend/app/routes/Sales data files/
+backend/app/routes/ingest.py.backup
+backend/app/routes/New Text Document.txt
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
