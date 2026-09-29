@@ -3,7 +3,12 @@ import React, { useRef, useState } from "react";
 const VOICE_SERVER_URL = "https://aptstock.onrender.com/api/voice";
 const SAMPLE_RATE = 24000;
 
-export default function VoiceAgent({ dashboardData }) {
+export default function VoiceAgent({ dashboardData, store }) {
+  console.log("🔎 APTSTOCK DASHBOARD DATA:", dashboardData);
+  console.log(
+    "🔎 DASHBOARD KEYS:",
+    Object.keys(dashboardData || {})
+  );
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState("Ready");
   const [transcript, setTranscript] = useState("");
@@ -16,10 +21,12 @@ export default function VoiceAgent({ dashboardData }) {
   const processorRef = useRef(null);
   const silentGainRef = useRef(null);
   const pendingToolsRef = useRef([]);
+  const toolTurnReadyRef = useRef(false);
 
-  const playbackContextRef = useRef(null);
-  const playbackNextTimeRef = useRef(0);
-  const playbackSourcesRef = useRef([]);
+const playbackContextRef = useRef(null);
+const playbackNextTimeRef = useRef(0);
+const playbackSourcesRef = useRef([]);
+const playbackGenerationRef = useRef(0);
 
   const cleanup = () => {
     try {
@@ -59,93 +66,217 @@ export default function VoiceAgent({ dashboardData }) {
       } catch {}
     });
 
+    playbackGenerationRef.current += 1;
+
     playbackSourcesRef.current = [];
     playbackNextTimeRef.current = 0;
   };
 
   const flushPlayback = () => {
-    playbackSourcesRef.current.forEach((source) => {
-      try {
-        source.stop();
-      } catch {}
-    });
+  // Invalidate any reply.audio work that is still completing asynchronously.
+  playbackGenerationRef.current += 1;
 
-    playbackSourcesRef.current = [];
-
-    if (playbackContextRef.current) {
-      playbackNextTimeRef.current =
-        playbackContextRef.current.currentTime;
-    }
-  };
-
-  const playReplyAudio = async (base64Audio) => {
+  playbackSourcesRef.current.forEach((source) => {
     try {
-      if (!base64Audio) return;
+      source.onended = null;
+      source.stop(0);
+      source.disconnect();
+    } catch {}
+  });
 
-      if (!playbackContextRef.current) {
-        playbackContextRef.current = new AudioContext();
-      }
+  playbackSourcesRef.current = [];
 
-      const ctx = playbackContextRef.current;
+  if (playbackContextRef.current) {
+    playbackNextTimeRef.current =
+      playbackContextRef.current.currentTime;
+  } else {
+    playbackNextTimeRef.current = 0;
+  }
+};
 
-      if (ctx.state === "suspended") {
-        await ctx.resume();
-      }
+const flushPendingTools = (ws) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return;
+  }
 
-      // Base64 → binary
-      const binary = atob(base64Audio);
-      const pcm16 = new Int16Array(binary.length / 2);
+  if (!toolTurnReadyRef.current) {
+    return;
+  }
 
-      for (let i = 0; i < pcm16.length; i++) {
-        const low = binary.charCodeAt(i * 2);
-        const high = binary.charCodeAt(i * 2 + 1);
+  if (pendingToolsRef.current.length === 0) {
+    return;
+  }
 
-        pcm16[i] = low | (high << 8);
-      }
+  console.log(
+    "📤 Sending pending tool results:",
+    pendingToolsRef.current
+  );
 
-      // PCM16 → Float32
-      const float32 = new Float32Array(pcm16.length);
+  for (const tool of pendingToolsRef.current) {
+    ws.send(
+      JSON.stringify({
+        type: "tool.result",
+        call_id: tool.call_id,
+        result: JSON.stringify(tool.result)
+      })
+    );
+  }
 
-      for (let i = 0; i < pcm16.length; i++) {
-        float32[i] =
-          pcm16[i] < 0
-            ? pcm16[i] / 32768
-            : pcm16[i] / 32767;
-      }
+  pendingToolsRef.current = [];
+  toolTurnReadyRef.current = false;
+};
 
-      // AssemblyAI reply audio is 24 kHz mono PCM16.
-      const audioBuffer = ctx.createBuffer(
+  const playReplyAudio = async (
+  base64Audio,
+  generation
+) => {
+  try {
+    if (!base64Audio) return;
+
+    // Ignore audio belonging to an interrupted/old reply.
+    if (
+      generation !==
+      playbackGenerationRef.current
+    ) {
+      return;
+    }
+
+    if (!playbackContextRef.current) {
+      playbackContextRef.current =
+        new AudioContext();
+    }
+
+    const ctx =
+      playbackContextRef.current;
+
+    if (ctx.state === "suspended") {
+      await ctx.resume();
+    }
+
+    // IMPORTANT:
+    // The reply may have been interrupted while
+    // AudioContext.resume() was awaiting.
+    if (
+      generation !==
+      playbackGenerationRef.current
+    ) {
+      return;
+    }
+
+    // Base64 → binary
+    const binary = atob(base64Audio);
+
+    const pcm16 =
+      new Int16Array(
+        binary.length / 2
+      );
+
+    for (
+      let i = 0;
+      i < pcm16.length;
+      i++
+    ) {
+      const low =
+        binary.charCodeAt(i * 2);
+
+      const high =
+        binary.charCodeAt(i * 2 + 1);
+
+      pcm16[i] =
+        low | (high << 8);
+    }
+
+    // PCM16 → Float32
+    const float32 =
+      new Float32Array(
+        pcm16.length
+      );
+
+    for (
+      let i = 0;
+      i < pcm16.length;
+      i++
+    ) {
+      float32[i] =
+        pcm16[i] < 0
+          ? pcm16[i] / 32768
+          : pcm16[i] / 32767;
+    }
+
+    // AssemblyAI reply audio:
+    // 24 kHz mono PCM16.
+    const audioBuffer =
+      ctx.createBuffer(
         1,
         float32.length,
         SAMPLE_RATE
       );
 
-      audioBuffer.copyToChannel(float32, 0);
+    audioBuffer.copyToChannel(
+      float32,
+      0
+    );
 
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(ctx.destination);
-
-      const now = ctx.currentTime;
-
-      if (playbackNextTimeRef.current < now) {
-        playbackNextTimeRef.current = now;
-      }
-
-      source.start(playbackNextTimeRef.current);
-
-      playbackNextTimeRef.current += audioBuffer.duration;
-
-      playbackSourcesRef.current.push(source);
-
-      source.onended = () => {
-        playbackSourcesRef.current =
-          playbackSourcesRef.current.filter((s) => s !== source);
-      };
-    } catch (error) {
-      console.error("Reply audio playback error:", error);
+    // Check one more time before scheduling.
+    if (
+      generation !==
+      playbackGenerationRef.current
+    ) {
+      return;
     }
-  };
+
+    const source =
+      ctx.createBufferSource();
+
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const now = ctx.currentTime;
+
+    if (
+      playbackNextTimeRef.current <
+      now
+    ) {
+      playbackNextTimeRef.current =
+        now;
+    }
+
+    // Final stale-audio protection.
+    if (
+      generation !==
+      playbackGenerationRef.current
+    ) {
+      try {
+        source.disconnect();
+      } catch {}
+
+      return;
+    }
+
+    source.start(
+      playbackNextTimeRef.current
+    );
+
+    playbackNextTimeRef.current +=
+      audioBuffer.duration;
+
+    playbackSourcesRef.current.push(
+      source
+    );
+
+    source.onended = () => {
+      playbackSourcesRef.current =
+        playbackSourcesRef.current.filter(
+          (s) => s !== source
+        );
+    };
+  } catch (error) {
+    console.error(
+      "Reply audio playback error:",
+      error
+    );
+  }
+};
 
   const startMicrophone = async (ws) => {
     try {
@@ -359,6 +490,72 @@ export default function VoiceAgent({ dashboardData }) {
                     },
                     required: ["store"]
                   }
+                },
+                {
+                  type: "function",
+                  name: "prepare_reorder",
+                  description:
+                    "Prepare a reorder draft for a specific SKU. Never place an order without confirmation.",
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      store: {
+                        type: "string",
+                        description: "Current AptStock store name."
+                      },
+                      sku: {
+                        type: "string",
+                        description: "Exact SKU."
+                      },
+                      quantity: {
+                        type: "integer",
+                        description: "Recommended reorder quantity."
+                      }
+                    },
+                    required: ["store", "sku", "quantity"]
+                  }
+                },
+                {
+                  type: "function",
+                  name: "cancel_reorder",
+                  description:
+                    "Cancel a pending reorder draft for a specific SKU. Only cancel a reorder that is currently pending confirmation.",
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      store: {
+                        type: "string",
+                        description: "Current AptStock store name."
+                      },
+                      sku: {
+                        type: "string",
+                        description: "Exact SKU of the pending reorder to cancel."
+                      }
+                    },
+                    required: ["store", "sku"]
+                  }
+                },
+                {
+                  type: "function",
+                  name: "transfer_to_human",
+                  description:
+                    "Request assistance from an AptStock human team member when the customer asks to speak with a person or needs human support.",
+                  parameters: {
+                    type: "object",
+                    properties: {
+                      reason: {
+                        type: "string",
+                        description: "Short reason why the customer wants human assistance."
+                      },
+                      summary: {
+                        type: "string",
+                        description: "Short summary of what the customer needs help with."
+                      }
+                    },
+                    required: ["reason", "summary"]
+                  },
+                  execution_mode: "hold",
+                  timeout_seconds: 60
                 }
               ]
             }
@@ -379,9 +576,11 @@ export default function VoiceAgent({ dashboardData }) {
           if (message.type === "tool.call") {
             console.log("🔧 Tool call:", message);
 
+            toolTurnReadyRef.current = false;
+
             if (message.name === "get_inventory_alerts") {
               const compactResult = {
-                store: dashboardData?.store || "Current Store",
+                store: store?.trim() || dashboardData?.store?.trim() || "",
 
                 status: "connected",
 
@@ -418,6 +617,270 @@ export default function VoiceAgent({ dashboardData }) {
                 result: compactResult
               });
             }
+
+            if (message.name === "prepare_reorder") {
+  const args = message.arguments || {};
+
+  const actualStore =
+    store?.trim() ||
+    dashboardData?.store?.trim() ||
+    "";
+
+  const sku = String(args.sku || "").trim();
+  const quantity = Number(args.quantity);
+
+  console.log("🔥 PREPARE_REORDER ARGUMENTS:", {
+    modelStore: args.store,
+    actualStore,
+    sku,
+    quantity
+  });
+
+  if (!actualStore) {
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result: {
+        status: "ERROR",
+        message:
+          "No active store is selected. Please select a store before preparing a reorder."
+      }
+    });
+
+    flushPendingTools(ws);
+    return;
+  }
+
+  if (!sku) {
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result: {
+        status: "ERROR",
+        message:
+          "No SKU was provided for the reorder."
+      }
+    });
+
+    flushPendingTools(ws);
+    return;
+  }
+
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result: {
+        status: "ERROR",
+        message:
+          "The reorder quantity is invalid."
+      }
+    });
+
+    flushPendingTools(ws);
+    return;
+  }
+
+  const startedAt = performance.now();
+
+  console.log("🚀 PREPARE_REORDER REQUEST STARTED");
+
+  try {
+    const response = await fetch(
+      "https://aptstock.onrender.com/api/inventory/prepare-reorder",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          store: actualStore,
+          sku,
+          quantity
+        })
+      }
+    );
+
+    const result = await response.json();
+
+    const elapsedMs = Math.round(
+      performance.now() - startedAt
+    );
+
+    console.log(
+      "📦 PREPARE_REORDER RESPONSE:",
+      {
+        status: response.status,
+        elapsedMs,
+        result
+      }
+    );
+
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result
+    });
+
+    /*
+     * IMPORTANT:
+     *
+     * If reply.done already arrived while Render
+     * was processing the request, flushPendingTools()
+     * sends the result now.
+     *
+     * If reply.done has NOT arrived yet, this does
+     * nothing. The reply.done handler will flush it.
+     */
+    flushPendingTools(ws);
+
+  } catch (error) {
+    console.error(
+      "❌ Prepare reorder tool error:",
+      error
+    );
+
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result: {
+        status: "ERROR",
+        message:
+          "Unable to prepare the reorder right now."
+      }
+    });
+
+    flushPendingTools(ws);
+  }
+
+  return;
+}
+
+            if (message.name === "cancel_reorder") {
+  const args = message.arguments || {};
+
+  try {
+    const actualStore =
+      store?.trim() ||
+      dashboardData?.store?.trim() ||
+      "";
+
+    const sku = String(args.sku || "").trim();
+
+    console.log("❌ CANCEL_REORDER ARGUMENTS:", {
+      modelStore: args.store,
+      actualStore,
+      sku
+    });
+
+    if (!actualStore) {
+      pendingToolsRef.current.push({
+        call_id: message.call_id,
+        result: {
+          status: "ERROR",
+          message:
+            "No active store is selected."
+        }
+      });
+
+      return;
+    }
+
+    if (!sku) {
+      pendingToolsRef.current.push({
+        call_id: message.call_id,
+        result: {
+          status: "ERROR",
+          message:
+            "No SKU was provided for cancellation."
+        }
+      });
+
+      return;
+    }
+
+    const response = await fetch(
+      "https://aptstock.onrender.com/api/inventory/cancel-reorder",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          store: actualStore,
+          sku
+        })
+      }
+    );
+
+    const result = await response.json();
+
+    console.log("📦 CANCEL_REORDER RESPONSE:", {
+      status: response.status,
+      result
+    });
+
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result
+    });
+
+  } catch (error) {
+    console.error(
+      "❌ Cancel reorder tool error:",
+      error
+    );
+
+    pendingToolsRef.current.push({
+      call_id: message.call_id,
+      result: {
+        status: "ERROR",
+        message:
+          "Unable to cancel the pending reorder right now."
+      }
+    });
+  }
+}
+
+              if (message.name === "transfer_to_human") {
+                const args = message.arguments || {};
+
+                try {
+                  const response = await fetch(
+                    `https://aptstock.onrender.com/api/inventory/request-human-assistance`,
+                    {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json"
+                      },
+                      body: JSON.stringify({
+                        reason:
+                          args.reason ||
+                          "Customer requested human assistance.",
+                        summary:
+                          args.summary ||
+                          "Customer would like to speak with an AptStock team member."
+                      })
+                    }
+                  );
+
+                  const result = await response.json();
+
+                  pendingToolsRef.current.push({
+                    call_id: message.call_id,
+                    result
+                  });
+                } catch (error) {
+                  console.error(
+                    "❌ Human assistance tool error:",
+                    error
+                  );
+
+                  pendingToolsRef.current.push({
+                    call_id: message.call_id,
+                    result: {
+                      status: "ERROR",
+                      message:
+                        "Unable to submit the human assistance request right now."
+                    }
+                  });
+                }
+              }
 
             return;
           }
@@ -478,46 +941,68 @@ export default function VoiceAgent({ dashboardData }) {
             message.type ===
             "reply.started"
           ) {
+            playbackGenerationRef.current += 1;
             setVoiceState("thinking");
             return;
           }
 
           if (
-            message.type ===
-            "reply.audio"
-          ) {
-            setVoiceState("speaking");
-            // AssemblyAI sends audio in `data`
-            await playReplyAudio(
-              message.data
-            );
+  message.type ===
+  "reply.audio"
+) {
+  setVoiceState("speaking");
 
-            return;
-          }
+  // Capture the generation that this audio belongs to.
+  const generation =
+    playbackGenerationRef.current;
+
+  // AssemblyAI sends audio in `data`.
+  await playReplyAudio(
+    message.data,
+    generation
+  );
+
+  return;
+}
 
           if (message.type === "reply.done") {
-            if (message.status === "interrupted") {
-              pendingToolsRef.current = [];
-              flushPlayback();
-            } else if (pendingToolsRef.current.length > 0) {
-              for (const tool of pendingToolsRef.current) {
-                if (ws.readyState === WebSocket.OPEN) {
-                  ws.send(
-                    JSON.stringify({
-                      type: "tool.result",
-                      call_id: tool.call_id,
-                      result: JSON.stringify(tool.result)
-                    })
-                  );
-                }
-              }
+  console.log(
+    "🏁 reply.done:",
+    message.status || "completed"
+  );
 
-              pendingToolsRef.current = [];
-            }
+  if (message.status === "interrupted") {
+    console.log(
+      "🛑 Reply interrupted — clearing pending tools."
+    );
 
-            setVoiceState("listening");
-            return;
-          }
+    pendingToolsRef.current = [];
+    toolTurnReadyRef.current = false;
+
+    flushPlayback();
+
+    setVoiceState("listening");
+    return;
+  }
+
+  /*
+   * AssemblyAI says tool.result should be sent when
+   * reply.done is the latest event.
+   *
+   * Mark the turn ready, then flush whatever tool
+   * result is already available.
+   *
+   * If Render has NOT returned yet, the fetch()
+   * completion will call flushPendingTools(ws)
+   * again.
+   */
+  toolTurnReadyRef.current = true;
+
+  flushPendingTools(ws);
+
+  setVoiceState("listening");
+  return;
+}
 
           if (
             message.type ===
@@ -546,6 +1031,12 @@ export default function VoiceAgent({ dashboardData }) {
             console.log(
               "🎤 Speech detected"
             );
+
+            // Immediately stop any queued agent audio
+  // when the user starts speaking.
+            flushPlayback();
+
+            setVoiceState("listening");
             setVoiceState("listening");
 
             return;
