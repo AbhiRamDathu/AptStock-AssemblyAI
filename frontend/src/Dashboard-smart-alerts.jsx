@@ -3182,7 +3182,10 @@ const metricWarning = data?.business_metrics?.metric_warning;
           </div>
         </div>
 
-              <VoiceAgent dashboardData={data} />
+              <VoiceAgent
+                dashboardData={data}
+                store={filterStore}
+              />
         
         {/* Upload Status */}
         {uploadStatus &&  uploadStatus.message && (
